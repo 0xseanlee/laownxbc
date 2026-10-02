@@ -1,0 +1,665 @@
+cat >/tmp/trace_gk_callers.py <<'PY'
+#!/usr/bin/env python3
+
+import struct
+import bisect
+from collections import defaultdict
+from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+
+PATH = "/mnt/ios/Payload/OurNotes/Frameworks/bangdreamournotes.dylib"
+
+# 已確認的 class_t
+GK_CLASS = 0xCED6C0
+LH_CLASS = 0xCEE1B0
+
+INTERESTING_SELECTORS = {
+    # LHxbz builder family
+    "BwBYYWSRHrFwKalynUkKrDGP",
+    "bJyyvPEHsYhWvmkKUoVwUiTAFRoBbQhXYnspWQiWZPUWWME",
+    "FkpuboJwwUOjlJsoeWtdYcmPtZnQIeGxfuGgQAWUGXqaBpwOXiAGOHaXKYeWCUT",
+    "TtuIgrYTXvVhPbySMrcklGPBoAhVsHZGDfEShogNPUXPgLqLLUwenuwTILmNokGEPnrxVSzH",
+
+    # Gk factory / init / validation
+    "jDejqlMWWHKMOLFJqGfsOcVeIFnNlwHMugYlgpVCFgjB",
+    "HcfYIpPuQoREagyRCTuGsDMumAoZFfUEZajcGMWXOd",
+    "pzwSlKYUoLJfDNwWsMSEZiYCQprygLHRPzviNFzuuYtSGYqeUTCkiWZorrSIVFNcg",
+    "VXMbO",
+    "hwgizNbPooZ",
+    "YVYhfTBBIqJRBDGpiLIEacJXEJlrg",
+
+    # Gk descriptor fields
+    "type",
+    "setType:",
+    "active",
+    "setActive:",
+    "offset",
+    "setOffset:",
+    "signature",
+    "setSignature:",
+    "range",
+    "setRange:",
+    "searchDirection",
+    "setSearchDirection:",
+    "identifier",
+    "setIdentifier:",
+    "architecture",
+}
+
+WEIGHTS = {
+    "CLASS:GkOEznX": 12,
+    "CLASS:LHxbzDSewNaAjVygv": 10,
+
+    "SEL:FkpuboJwwUOjlJsoeWtdYcmPtZnQIeGxfuGgQAWUGXqaBpwOXiAGOHaXKYeWCUT": 12,
+    "SEL:bJyyvPEHsYhWvmkKUoVwUiTAFRoBbQhXYnspWQiWZPUWWME": 9,
+    "SEL:TtuIgrYTXvVhPbySMrcklGPBoAhVsHZGDfEShogNPUXPgLqLLUwenuwTILmNokGEPnrxVSzH": 9,
+
+    "SEL:jDejqlMWWHKMOLFJqGfsOcVeIFnNlwHMugYlgpVCFgjB": 10,
+    "SEL:HcfYIpPuQoREagyRCTuGsDMumAoZFfUEZajcGMWXOd": 8,
+
+    "SEL:setOffset:": 6,
+    "SEL:setSignature:": 6,
+    "SEL:setRange:": 4,
+    "SEL:setSearchDirection:": 4,
+    "SEL:setType:": 4,
+    "SEL:setActive:": 3,
+    "SEL:setIdentifier:": 3,
+}
+
+with open(PATH, "rb") as f:
+    data = f.read()
+
+def u32(off):
+    return struct.unpack_from("<I", data, off)[0]
+
+def u64(off):
+    return struct.unpack_from("<Q", data, off)[0]
+
+def s64(v, bits):
+    sign = 1 << (bits - 1)
+    return (v ^ sign) - sign
+
+def raw_cstr(off):
+    if off < 0 or off >= len(data):
+        return None
+    end = data.find(b"\0", off)
+    if end < 0:
+        return None
+    try:
+        return data[off:end].decode("utf-8", "replace")
+    except Exception:
+        return None
+
+# ------------------------------------------------------------
+# Mach-O parsing
+# ------------------------------------------------------------
+
+if len(data) < 32:
+    raise SystemExit("File too small")
+
+magic = u32(0)
+
+if magic != 0xFEEDFACF:
+    raise SystemExit(f"Unexpected Mach-O magic: 0x{magic:08x}")
+
+ncmds = u32(16)
+
+segments = []
+sections = {}
+function_starts_info = None
+
+off = 32
+
+for _ in range(ncmds):
+    cmd = u32(off)
+    cmdsize = u32(off + 4)
+
+    if cmd == 0x19:  # LC_SEGMENT_64
+        segname = data[off+8:off+24].split(b"\0")[0].decode("ascii", "replace")
+        vmaddr  = u64(off + 24)
+        vmsize  = u64(off + 32)
+        fileoff = u64(off + 40)
+        filesize = u64(off + 48)
+        nsects  = u32(off + 64)
+
+        segments.append({
+            "name": segname,
+            "vmaddr": vmaddr,
+            "vmsize": vmsize,
+            "fileoff": fileoff,
+            "filesize": filesize,
+        })
+
+        so = off + 72
+
+        for i in range(nsects):
+            sec = so + i * 80
+
+            sectname = data[sec:sec+16].split(b"\0")[0].decode("ascii", "replace")
+            secseg = data[sec+16:sec+32].split(b"\0")[0].decode("ascii", "replace")
+
+            addr = u64(sec + 32)
+            size = u64(sec + 40)
+            file_offset = u32(sec + 48)
+
+            sections[(secseg, sectname)] = {
+                "addr": addr,
+                "size": size,
+                "offset": file_offset,
+            }
+
+    elif cmd == 0x26:  # LC_FUNCTION_STARTS
+        function_starts_info = (
+            u32(off + 8),
+            u32(off + 12),
+        )
+
+    off += cmdsize
+
+def vm_to_off(vm):
+    for seg in segments:
+        start = seg["vmaddr"]
+        end = start + seg["filesize"]
+
+        if start <= vm < end:
+            return seg["fileoff"] + (vm - start)
+
+    return None
+
+def vm_u64(vm):
+    o = vm_to_off(vm)
+
+    if o is None or o + 8 > len(data):
+        return None
+
+    return u64(o)
+
+def vm_cstr(vm):
+    o = vm_to_off(vm)
+
+    if o is None:
+        return None
+
+    return raw_cstr(o)
+
+text_sec = sections.get(("__TEXT", "__text"))
+
+if not text_sec:
+    raise SystemExit("Cannot find __TEXT,__text")
+
+TEXT_ADDR = text_sec["addr"]
+TEXT_SIZE = text_sec["size"]
+TEXT_OFF  = text_sec["offset"]
+
+print("=== TARGET ===")
+print(f"file       = {PATH}")
+print(f"__text     = 0x{TEXT_ADDR:x} .. 0x{TEXT_ADDR + TEXT_SIZE:x}")
+print(f"Gk class_t = 0x{GK_CLASS:x}")
+print(f"LH class_t = 0x{LH_CLASS:x}")
+print()
+
+# ------------------------------------------------------------
+# class name + ObjC method map
+# ------------------------------------------------------------
+
+class_names = {}
+method_names = defaultdict(list)
+
+def parse_class_ro(class_vm, prefix):
+    co = vm_to_off(class_vm)
+
+    if co is None or co + 40 > len(data):
+        return None
+
+    isa = u64(co)
+    bits = u64(co + 32)
+
+    # class data bits low flag bits
+    ro_vm = bits & ~0x7
+
+    ro = vm_to_off(ro_vm)
+
+    if ro is None or ro + 40 > len(data):
+        return None
+
+    name_vm = u64(ro + 24)
+    methods_vm = u64(ro + 32)
+
+    name = vm_cstr(name_vm)
+
+    if not name:
+        return None
+
+    class_names[class_vm] = name
+
+    mo = vm_to_off(methods_vm)
+
+    if mo is None or mo + 8 > len(data):
+        return name
+
+    entsize_flags = u32(mo)
+    count = u32(mo + 4)
+    entsize = entsize_flags & 0xFFFF
+
+    # 目前這個 dylib 已確認主要是舊式 24-byte absolute method entry
+    if entsize < 24 or entsize > 64:
+        return name
+
+    for i in range(count):
+        e = mo + 8 + i * entsize
+
+        if e + 24 > len(data):
+            break
+
+        name_ptr = u64(e)
+        type_ptr = u64(e + 8)
+        imp = u64(e + 16)
+
+        sel = vm_cstr(name_ptr)
+
+        if not sel:
+            continue
+
+        method_names[imp].append(f"{prefix}[{name} {sel}]")
+
+    return name
+
+classlist_secs = [
+    v for (seg, sec), v in sections.items()
+    if sec == "__objc_classlist"
+]
+
+for sec in classlist_secs:
+    count = sec["size"] // 8
+
+    for i in range(count):
+        slot_off = sec["offset"] + i * 8
+
+        if slot_off + 8 > len(data):
+            break
+
+        cls = u64(slot_off)
+
+        if not cls:
+            continue
+
+        name = parse_class_ro(cls, "-")
+
+        co = vm_to_off(cls)
+
+        if co is not None and co + 8 <= len(data):
+            meta = u64(co)
+
+            if meta:
+                parse_class_ro(meta, "+")
+
+# ------------------------------------------------------------
+# Selector refs
+# ------------------------------------------------------------
+
+selector_slots = defaultdict(list)
+
+selref_secs = [
+    v for (seg, sec), v in sections.items()
+    if sec == "__objc_selrefs"
+]
+
+for sec in selref_secs:
+    count = sec["size"] // 8
+
+    for i in range(count):
+        slot_vm = sec["addr"] + i * 8
+        slot_off = sec["offset"] + i * 8
+
+        if slot_off + 8 > len(data):
+            break
+
+        ptr = u64(slot_off)
+
+        if not ptr:
+            continue
+
+        name = vm_cstr(ptr)
+
+        if name:
+            selector_slots[name].append(slot_vm)
+
+# ------------------------------------------------------------
+# Classrefs
+# ------------------------------------------------------------
+
+classref_targets = {}
+
+classref_secs = [
+    v for (seg, sec), v in sections.items()
+    if sec == "__objc_classrefs"
+]
+
+for sec in classref_secs:
+    count = sec["size"] // 8
+
+    for i in range(count):
+        slot_vm = sec["addr"] + i * 8
+        slot_off = sec["offset"] + i * 8
+
+        if slot_off + 8 > len(data):
+            break
+
+        ptr = u64(slot_off)
+
+        if ptr == GK_CLASS:
+            classref_targets[slot_vm] = "CLASS:GkOEznX"
+
+        elif ptr == LH_CLASS:
+            classref_targets[slot_vm] = "CLASS:LHxbzDSewNaAjVygv"
+
+print("=== CLASSREFS ===")
+
+if classref_targets:
+    for slot, label in sorted(classref_targets.items()):
+        print(f"0x{slot:x} -> {label}")
+else:
+    print("No direct classrefs found")
+
+print()
+
+# ------------------------------------------------------------
+# Interesting selector slots
+# ------------------------------------------------------------
+
+target_slots = dict(classref_targets)
+
+print("=== INTERESTING SELREFS ===")
+
+for name in sorted(INTERESTING_SELECTORS):
+    slots = selector_slots.get(name, [])
+
+    for slot in slots:
+        label = "SEL:" + name
+        target_slots[slot] = label
+        print(f"0x{slot:x} -> {name}")
+
+print()
+
+# ------------------------------------------------------------
+# LC_FUNCTION_STARTS
+# ------------------------------------------------------------
+
+function_starts = []
+
+def read_uleb(buf, pos, end):
+    result = 0
+    shift = 0
+
+    while pos < end:
+        b = buf[pos]
+        pos += 1
+
+        result |= (b & 0x7F) << shift
+
+        if not (b & 0x80):
+            return result, pos
+
+        shift += 7
+
+    return None, pos
+
+if function_starts_info:
+    fs_off, fs_size = function_starts_info
+
+    pos = fs_off
+    end = fs_off + fs_size
+    current = 0
+
+    text_seg = None
+
+    for seg in segments:
+        if seg["name"] == "__TEXT":
+            text_seg = seg
+            break
+
+    base = text_seg["vmaddr"] if text_seg else 0
+
+    while pos < end:
+        delta, pos = read_uleb(data, pos, end)
+
+        if delta is None or delta == 0:
+            break
+
+        current += delta
+        function_starts.append(base + current)
+
+function_starts = sorted(set(function_starts))
+
+def containing_function(addr):
+    if not function_starts:
+        return addr, addr + 0x200
+
+    i = bisect.bisect_right(function_starts, addr) - 1
+
+    if i < 0:
+        return addr, addr + 0x200
+
+    start = function_starts[i]
+
+    if i + 1 < len(function_starts):
+        end = function_starts[i + 1]
+    else:
+        end = start + 0x400
+
+    # 防止異常超大 function 造成輸出爆炸
+    if end - start > 0x2000:
+        end = start + 0x2000
+
+    return start, end
+
+# ------------------------------------------------------------
+# ARM64 ADRP + LDR decoder
+# ------------------------------------------------------------
+
+def decode_adrp(word, pc):
+    if (word & 0x9F000000) != 0x90000000:
+        return None
+
+    rd = word & 0x1F
+
+    immlo = (word >> 29) & 0x3
+    immhi = (word >> 5) & 0x7FFFF
+
+    imm21 = (immhi << 2) | immlo
+    imm21 = s64(imm21, 21)
+
+    target_page = (pc & ~0xFFF) + (imm21 << 12)
+
+    return rd, target_page
+
+def decode_ldr64_unsigned(word):
+    if (word & 0xFFC00000) != 0xF9400000:
+        return None
+
+    rt = word & 0x1F
+    rn = (word >> 5) & 0x1F
+    imm12 = (word >> 10) & 0xFFF
+
+    return rt, rn, imm12 * 8
+
+text_bytes = data[TEXT_OFF:TEXT_OFF + TEXT_SIZE]
+
+hits = []
+
+for off0 in range(0, len(text_bytes) - 16, 4):
+    word = struct.unpack_from("<I", text_bytes, off0)[0]
+    pc = TEXT_ADDR + off0
+
+    a = decode_adrp(word, pc)
+
+    if not a:
+        continue
+
+    base_reg, page = a
+
+    # compiler 通常在接下來幾條內 LDR selref/classref
+    for step in range(1, 5):
+        o2 = off0 + step * 4
+
+        if o2 + 4 > len(text_bytes):
+            break
+
+        w2 = struct.unpack_from("<I", text_bytes, o2)[0]
+        l = decode_ldr64_unsigned(w2)
+
+        if not l:
+            continue
+
+        rt, rn, disp = l
+
+        if rn != base_reg:
+            continue
+
+        target = page + disp
+
+        if target in target_slots:
+            hits.append({
+                "adrp": pc,
+                "load": TEXT_ADDR + o2,
+                "slot": target,
+                "label": target_slots[target],
+            })
+
+# ------------------------------------------------------------
+# Aggregate by function
+# ------------------------------------------------------------
+
+funcs = {}
+
+for hit in hits:
+    fs, fe = containing_function(hit["adrp"])
+
+    if fs not in funcs:
+        funcs[fs] = {
+            "start": fs,
+            "end": fe,
+            "hits": [],
+            "labels": set(),
+        }
+
+    funcs[fs]["hits"].append(hit)
+    funcs[fs]["labels"].add(hit["label"])
+
+def score_func(info):
+    score = 0
+
+    for label in info["labels"]:
+        score += WEIGHTS.get(label, 1)
+
+    # 同時碰 Gk/LH + builder/factory，額外加分
+    if "CLASS:GkOEznX" in info["labels"]:
+        if any(x.startswith("SEL:") for x in info["labels"]):
+            score += 5
+
+    if "CLASS:LHxbzDSewNaAjVygv" in info["labels"]:
+        score += 4
+
+    # 多種不同 refs 代表更像 orchestration/builder
+    score += max(0, len(info["labels"]) - 1) * 2
+
+    return score
+
+ranked = sorted(
+    funcs.values(),
+    key=lambda x: (-score_func(x), x["start"])
+)
+
+print("=== SUMMARY ===")
+print(f"raw interesting refs = {len(hits)}")
+print(f"candidate functions  = {len(ranked)}")
+print()
+
+if not ranked:
+    print("No result")
+    raise SystemExit(0)
+
+for idx, info in enumerate(ranked[:30], 1):
+    fs = info["start"]
+    score = score_func(info)
+
+    names = method_names.get(fs, [])
+
+    print(f"[{idx:02d}] function 0x{fs:x}  score={score}")
+
+    if names:
+        for n in names:
+            print(f"     objc: {n}")
+    else:
+        print("     objc: <unknown / non-ObjC / no metadata match>")
+
+    for label in sorted(info["labels"]):
+        print(f"     ref : {label}")
+
+    print("     xrefs:")
+
+    for h in sorted(info["hits"], key=lambda x: x["adrp"]):
+        print(
+            f"       0x{h['adrp']:x} -> slot 0x{h['slot']:x} "
+            f"({h['label']})"
+        )
+
+    print()
+
+# ------------------------------------------------------------
+# Disassembly around highest-value candidates
+# ------------------------------------------------------------
+
+md = Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+
+print("=== TOP CANDIDATE DISASSEMBLY ===")
+
+for idx, info in enumerate(ranked[:8], 1):
+    fs = info["start"]
+    fe = info["end"]
+
+    # 只印 candidate function 前最多 0x300 bytes
+    show_end = min(fe, fs + 0x300)
+
+    fo = vm_to_off(fs)
+
+    if fo is None:
+        continue
+
+    blob = data[fo:fo + (show_end - fs)]
+
+    print()
+    print("=" * 72)
+    print(
+        f"CANDIDATE {idx} "
+        f"function=0x{fs:x} score={score_func(info)}"
+    )
+
+    names = method_names.get(fs, [])
+
+    if names:
+        for n in names:
+            print(n)
+
+    print("-" * 72)
+
+    hit_addrs = {h["adrp"] for h in info["hits"]}
+    load_addrs = {h["load"] for h in info["hits"]}
+
+    for ins in md.disasm(blob, fs):
+        mark = "  "
+
+        if ins.address in hit_addrs:
+            mark = ">>"
+        elif ins.address in load_addrs:
+            mark = "*>"
+
+        print(
+            f"{mark} 0x{ins.address:08x}: "
+            f"{ins.mnemonic:<8} {ins.op_str}"
+        )
+
+print()
+print("=== END ===")
+PY
+
+python3 /tmp/trace_gk_callers.py >/dev/clipboard 2>&1
